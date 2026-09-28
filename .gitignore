@@ -1,0 +1,1136 @@
+#!/usr/bin/env python3
+"""
+Hand Control - Computer mit Handgesten steuern.
+
+Funktionen:
+- Maus steuern
+- Klicks, Drag, Scrollen, Lautstärke
+- globale Tastenkombinationen und Tray-Menü
+- Vorschau mit Hilfe/Debug/Zone
+
+Installation:
+    pip install -r requirements.txt
+
+Start:
+    python hand_control.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import threading
+import time
+import urllib.request
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+
+import cv2
+import numpy as np
+
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision
+except ImportError as exc:
+    raise SystemExit(
+        "mediapipe fehlt. Bitte installiere die Abhängigkeiten mit:\n"
+        "  pip install -r requirements.txt"
+    ) from exc
+
+try:
+    import pyautogui
+except ImportError as exc:
+    raise SystemExit(
+        "pyautogui fehlt. Bitte installiere die Abhängigkeiten mit:\n"
+        "  pip install -r requirements.txt"
+    ) from exc
+
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0
+
+# Optionale Module
+try:
+    from pynput import keyboard as pynput_keyboard
+except Exception:
+    pynput_keyboard = None
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+except Exception:
+    pystray = None
+
+try:
+    import winsound
+except ImportError:
+    winsound = None
+
+
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task"
+)
+MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task"
+)
+
+WIN = "Hand Control"
+MINI_W, MINI_H = 420, 236
+NEXT_PREVIEW = {"none": "mini", "mini": "full", "full": "none"}
+
+GREEN = (0, 255, 0)
+DARK_GREEN = (0, 150, 0)
+DIM_GREEN = (0, 110, 0)
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+RED = (0, 0, 255)
+YELLOW = (0, 255, 255)
+CYAN = (255, 200, 0)
+
+WRIST = 0
+THUMB_TIP = 4
+INDEX_MCP, INDEX_TIP = 5, 8
+MIDDLE_MCP = 9
+PINKY_MCP = 17
+
+FINGERS = {
+    "index": (5, 6, 8),
+    "middle": (9, 10, 12),
+    "ring": (13, 14, 16),
+    "pinky": (17, 18, 20),
+}
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+POSE_NAMES = {
+    "NONE": "keine Hand",
+    "OTHER": "unbekannt",
+    "POINT": "Zeigen -> Maus bewegen",
+    "PINCH_INDEX": "Pinch -> Linksklick / Ziehen",
+    "PINCH_MIDDLE": "Pinch Mittelfinger -> Rechtsklick",
+    "PINCH_RING": "Pinch Ringfinger -> Doppelklick",
+    "SCROLL": "Peace -> Scrollen",
+    "VOLUME": "Rock -> Lautstaerke",
+    "THREE": "3 Finger -> Task-Ansicht (halten)",
+    "OPEN": "Offene Hand -> Wischen",
+    "FIST": "Faust -> Ruhe",
+    "THUMB_UP": "Daumen hoch -> Play/Pause (halten)",
+    "THUMB_DOWN": "Daumen runter -> Stumm (halten)",
+    "SHAKA": "Shaka -> AN/AUS (halten)",
+}
+
+HOLD_LABELS = {
+    "three": "Task-Ansicht",
+    "thumb_up": "Play/Pause",
+    "thumb_down": "Stumm",
+    "toggle": "Steuerung AN/AUS",
+}
+
+CHEAT_SHEET = [
+    ("Zeigefinger", "Maus bewegen"),
+    ("Daumen+Zeige", "Linksklick / Ziehen"),
+    ("Daumen+Mittel", "Rechtsklick"),
+    ("Daumen+Ring", "Doppelklick"),
+    ("Peace", "Scrollen (hoch/runter)"),
+    ("Rock", "Lautstaerke (hoch/runter)"),
+    ("Hand wischen", "Pfeil links/rechts"),
+    ("3 Finger halten", "Task-Ansicht"),
+    ("Daumen hoch", "Play/Pause (halten)"),
+    ("Daumen runter", "Stumm (halten)"),
+    ("Faust", "Ruhe"),
+    ("Shaka halten", "Steuerung AN/AUS"),
+]
+
+
+def beep(kind: str):
+    """Akustische Rückmeldung bei Aktivierung/Deaktivierung."""
+    if not CFG.beep:
+        return
+
+    def _run():
+        try:
+            if winsound:
+                if kind == "on":
+                    winsound.Beep(1200, 110)
+                    winsound.Beep(1700, 110)
+                else:
+                    winsound.Beep(900, 110)
+                    winsound.Beep(600, 150)
+            else:
+                print("\a", end="", flush=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+@dataclass
+class Config:
+    camera: int = 0
+    width: int = 1280
+    height: int = 720
+    conf: float = 0.6
+    main_hand: str = "any"  # any | right | left
+    start_active: bool = False
+    preview: str = "mini"  # none | mini | full
+    max_fps: int = 30
+    beep: bool = True
+
+    # aktive Zone
+    margin_x: float = 0.18
+    margin_top: float = 0.10
+    margin_bottom: float = 0.35
+    tip_weight: float = 0.5
+
+    # smoothing
+    smooth: float = 1.2
+    beta: float = 0.01
+
+    # Gestenerkennung
+    ext_up: float = 1.5
+    ext_pinch_min: float = 1.2
+    pinch_on: float = 0.30
+    pinch_off: float = 0.50
+    freeze_ratio: float = 0.60
+    thumb_out: float = 1.0
+    stable_frames: int = 3
+
+    # Aktionen
+    drag_start: float = 0.035
+    scroll_speed: float = 1.0
+    invert_scroll: bool = False
+    scroll_dead: float = 0.035
+    volume_dead: float = 0.04
+    swipe_dx: float = 0.28
+    swipe_time: float = 0.45
+    hold_time: float = 0.8
+    toggle_hold: float = 1.0
+    click_cooldown: float = 0.4
+    action_cooldown: float = 1.5
+
+
+CFG = Config()
+SCROLL_GAIN = 20000.0
+
+
+def ensure_model() -> None:
+    if os.path.exists(MODEL_PATH):
+        return
+
+    print("Lade Hand-Modell herunter (einmalig, ca. 8 MB) ...")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("Fertig.")
+    except Exception as exc:
+        raise SystemExit(
+            f"Download fehlgeschlagen: {exc}\n"
+            f"Lade die Datei manuell von:\n{MODEL_URL}\n"
+            f"und lege sie hier ab:\n{MODEL_PATH}"
+        ) from exc
+
+
+class CameraStream:
+    def __init__(self, index: int, width: int, height: int):
+        backend = cv2.CAP_DSHOW if sys.platform.startswith("win") else cv2.CAP_ANY
+        self.cap = cv2.VideoCapture(index, backend)
+        if not self.cap.isOpened():
+            self.cap.release()
+            self.cap = cv2.VideoCapture(index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.lock = threading.Lock()
+        self.frame = None
+        self.frame_id = 0
+        self.stopped = False
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def opened(self) -> bool:
+        return self.cap.isOpened()
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _loop(self):
+        while not self.stopped:
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.01)
+                continue
+            with self.lock:
+                self.frame = frame
+                self.frame_id += 1
+
+    def read(self):
+        with self.lock:
+            if self.frame is None:
+                return None, self.frame_id
+            return self.frame.copy(), self.frame_id
+
+    def stop(self):
+        self.stopped = True
+        self.thread.join(timeout=1.0)
+        self.cap.release()
+
+
+class OneEuro:
+    def __init__(self, min_cutoff=1.0, beta=0.01, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.t_prev = None
+        self.x_prev = 0.0
+        self.dx_prev = 0.0
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x, t):
+        if self.t_prev is None:
+            self.t_prev, self.x_prev, self.dx_prev = t, x, 0.0
+            return x
+
+        dt = max(t - self.t_prev, 1e-3)
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(self.d_cutoff, dt)
+        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = self._alpha(cutoff, dt)
+        x_hat = a * x + (1 - a) * self.x_prev
+        self.t_prev, self.x_prev, self.dx_prev = t, x_hat, dx_hat
+        return x_hat
+
+
+def dist(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+class Features:
+    def __init__(self, pts, w, h):
+        self.pts = pts
+        wr = pts[WRIST]
+        self.palm = max(dist(wr, pts[MIDDLE_MCP]), 1.0)
+
+        self.ext = {}
+        for name, (mcp, _pip, tip) in FINGERS.items():
+            self.ext[name] = dist(wr, pts[tip]) / max(dist(wr, pts[mcp]), 1.0)
+
+        thresh = {
+            "index": CFG.ext_up,
+            "middle": CFG.ext_up,
+            "ring": CFG.ext_up - 0.05,
+            "pinky": CFG.ext_up - 0.15,
+        }
+        self.up = {n: self.ext[n] > thresh[n] for n in self.ext}
+
+        thumb = pts[THUMB_TIP]
+        self.thumb_reach = dist(thumb, pts[PINKY_MCP]) / self.palm
+        self.thumb_out = self.thumb_reach > CFG.thumb_out
+        self.pinch = {
+            n: dist(thumb, pts[tip]) / self.palm for n, (_m, _p, tip) in FINGERS.items()
+        }
+        self.thumb_up_dir = thumb[1] < pts[INDEX_MCP][1] - 0.4 * self.palm
+        self.thumb_down_dir = thumb[1] > wr[1] + 0.2 * self.palm
+
+        a = CFG.tip_weight
+        mcp, tip = pts[INDEX_MCP], pts[INDEX_TIP]
+        self.anchor = (
+            (mcp[0] + (tip[0] - mcp[0]) * a) / w,
+            (mcp[1] + (tip[1] - mcp[1]) * a) / h,
+        )
+        self.palm_c = (pts[MIDDLE_MCP][0] / w, pts[MIDDLE_MCP][1] / h)
+        self.anchor_px = (
+            int(mcp[0] + (tip[0] - mcp[0]) * a),
+            int(mcp[1] + (tip[1] - mcp[1]) * a),
+        )
+
+
+def classify(f, prev):
+    for name, pose in (
+        ("index", "PINCH_INDEX"),
+        ("middle", "PINCH_MIDDLE"),
+        ("ring", "PINCH_RING"),
+    ):
+        thr = CFG.pinch_off if prev == pose else CFG.pinch_on
+        if f.pinch[name] < thr and f.ext[name] > CFG.ext_pinch_min:
+            return pose
+
+    up = f.up
+    n_up = sum(up.values())
+
+    if n_up == 4:
+        return "OPEN"
+    if n_up == 0:
+        if f.thumb_out and f.thumb_up_dir:
+            return "THUMB_UP"
+        if f.thumb_out and f.thumb_down_dir:
+            return "THUMB_DOWN"
+        return "FIST"
+    if up["index"] and n_up == 1:
+        return "POINT"
+    if up["index"] and up["middle"] and n_up == 2:
+        return "SCROLL"
+    if up["index"] and up["pinky"] and n_up == 2:
+        return "VOLUME"
+    if up["index"] and up["middle"] and up["ring"] and n_up == 3:
+        return "THREE"
+    if up["pinky"] and n_up == 1 and f.thumb_out:
+        return "SHAKA"
+    return "OTHER"
+
+
+class Stabilizer:
+    def __init__(self):
+        self.cur = "NONE"
+        self.cand = None
+        self.count = 0
+
+    def reset(self):
+        self.cur, self.cand, self.count = "NONE", None, 0
+        return self.cur
+
+    def update(self, raw):
+        if raw == self.cur:
+            self.cand, self.count = None, 0
+            return self.cur
+        if raw == self.cand:
+            self.count += 1
+        else:
+            self.cand, self.count = raw, 1
+        need = 2 if raw.startswith("PINCH") else CFG.stable_frames
+        if self.count >= need:
+            self.cur, self.cand, self.count = raw, None, 0
+        return self.cur
+
+
+class Controller:
+    def __init__(self):
+        self.sw, self.sh = pyautogui.size()
+        self.active = CFG.start_active
+        self.pose = "NONE"
+        self.t = time.time()
+        self.last_t = self.t
+
+        self.fx = OneEuro(CFG.smooth, CFG.beta)
+        self.fy = OneEuro(CFG.smooth, CFG.beta)
+        self.need_resume = True
+        self.off = (0.0, 0.0)
+
+        self.mouse_down = False
+        self.dragging = False
+        self.pinch_anchor = (0.0, 0.0)
+
+        self.scroll_anchor = 0.0
+        self.scroll_acc = 0.0
+        self.vol_anchor = 0.0
+        self.vol_last = 0.0
+        self.swipe_hist = deque()
+
+        self.hold_start = {}
+        self.fired = set()
+        self.cooldown = {}
+
+        self.flash_text = ""
+        self.flash_until = 0.0
+        self.progress = 0.0
+        self.progress_label = ""
+        self.gauge = None
+
+    def flash(self, text, dur=0.9):
+        self.flash_text = text
+        self.flash_until = self.t + dur
+
+    def _ready(self, name, cd):
+        if self.cooldown.get(name, 0) > self.t:
+            return False
+        self.cooldown[name] = self.t + cd
+        return True
+
+    def _release(self):
+        if self.mouse_down:
+            try:
+                pyautogui.mouseUp()
+            except Exception:
+                pass
+        self.mouse_down = False
+        self.dragging = False
+
+    def toggle(self):
+        self.active = not self.active
+        if not self.active:
+            self._release()
+        self.flash("STEUERUNG AN" if self.active else "STEUERUNG AUS", 1.3)
+        beep("on" if self.active else "off")
+
+    def shutdown(self):
+        self._release()
+
+    def _hold(self, name, need, action):
+        if name in self.fired or self.cooldown.get(name, 0) > self.t:
+            return
+        start = self.hold_start.setdefault(name, self.t)
+        self.progress = min((self.t - start) / need, 1.0)
+        self.progress_label = name
+        if self.t - start >= need:
+            self.fired.add(name)
+            self.cooldown[name] = self.t + CFG.action_cooldown
+            action()
+
+    def _to_screen(self, anchor):
+        ax, ay = anchor
+        nx = (ax - CFG.margin_x) / (1 - 2 * CFG.margin_x)
+        ny = (ay - CFG.margin_top) / (1 - CFG.margin_top - CFG.margin_bottom)
+        nx = min(max(nx, 0.0), 1.0)
+        ny = min(max(ny, 0.0), 1.0)
+        return nx * (self.sw - 1), ny * (self.sh - 1)
+
+    def _move(self, anchor, dt):
+        tx, ty = self._to_screen(anchor)
+        if self.need_resume:
+            cx, cy = pyautogui.position()
+            self.off = (cx - tx, cy - ty)
+            self.fx.reset()
+            self.fy.reset()
+            self.need_resume = False
+        k = math.exp(-dt / 0.25)
+        self.off = (self.off[0] * k, self.off[1] * k)
+        x = self.fx(tx + self.off[0], self.t)
+        y = self.fy(ty + self.off[1], self.t)
+        x = min(max(x, 0), self.sw - 1)
+        y = min(max(y, 0), self.sh - 1)
+        pyautogui.moveTo(int(x), int(y))
+
+    def _exit(self, pose):
+        if pose == "PINCH_INDEX":
+            self._release()
+
+    def _enter(self, pose, f):
+        if pose == "PINCH_INDEX":
+            pyautogui.mouseDown()
+            self.mouse_down = True
+            self.dragging = False
+            self.pinch_anchor = f.anchor
+            self.flash("KLICK", 0.5)
+        elif pose == "PINCH_MIDDLE":
+            if self._ready("rclick", CFG.click_cooldown):
+                pyautogui.rightClick()
+                self.flash("RECHTSKLICK")
+        elif pose == "PINCH_RING":
+            if self._ready("dclick", CFG.click_cooldown):
+                pyautogui.doubleClick()
+                self.flash("DOPPELKLICK")
+        elif pose == "SCROLL":
+            self.scroll_anchor = f.palm_c[1]
+            self.scroll_acc = 0.0
+        elif pose == "VOLUME":
+            self.vol_anchor = f.palm_c[1]
+            self.vol_last = 0.0
+        elif pose == "OPEN":
+            self.swipe_hist.clear()
+
+    def _scroll(self, f, dt):
+        cy = f.palm_c[1]
+        d = self.scroll_anchor - cy
+        self.gauge = (self.scroll_anchor, cy, YELLOW)
+        if abs(d) > CFG.scroll_dead:
+            eff = d - math.copysign(CFG.scroll_dead, d)
+            sign = -1.0 if CFG.invert_scroll else 1.0
+            self.scroll_acc += sign * eff * SCROLL_GAIN * CFG.scroll_speed * dt
+            n = int(self.scroll_acc)
+            if n != 0:
+                pyautogui.scroll(n)
+                self.scroll_acc -= n
+        else:
+            self.scroll_acc = 0.0
+
+    def _volume(self, f):
+        cy = f.palm_c[1]
+        d = self.vol_anchor - cy
+        self.gauge = (self.vol_anchor, cy, CYAN)
+        if abs(d) > CFG.volume_dead:
+            eff = abs(d) - CFG.volume_dead
+            interval = max(0.06, 0.35 - eff * 2.5)
+            if self.t - self.vol_last >= interval:
+                if d > 0:
+                    pyautogui.press("volumeup")
+                    self.flash("LAUTER", 0.4)
+                else:
+                    pyautogui.press("volumedown")
+                    self.flash("LEISER", 0.4)
+                self.vol_last = self.t
+
+    def _swipe(self, f):
+        x, y = f.palm_c
+        self.swipe_hist.append((self.t, x, y))
+        while self.swipe_hist and self.t - self.swipe_hist[0][0] > CFG.swipe_time:
+            self.swipe_hist.popleft()
+        if len(self.swipe_hist) < 4 or self.cooldown.get("swipe", 0) > self.t:
+            return
+        _t0, x0, y0 = self.swipe_hist[0]
+        dx, dy = x - x0, y - y0
+        if abs(dx) > CFG.swipe_dx and abs(dy) < abs(dx) * 0.6:
+            if dx > 0:
+                pyautogui.press("right")
+                self.flash("WISCHEN -> RECHTS")
+            else:
+                pyautogui.press("left")
+                self.flash("WISCHEN <- LINKS")
+            self.cooldown["swipe"] = self.t + 1.0
+            self.swipe_hist.clear()
+
+    def _key(self, key, text):
+        pyautogui.press(key)
+        self.flash(text, 1.0)
+
+    def _task_view(self):
+        pyautogui.hotkey("win", "tab")
+        self.flash("TASK-ANSICHT", 1.0)
+
+    def update(self, pose, f, now):
+        self.t = now
+        dt = min(max(now - self.last_t, 1e-3), 0.2)
+        self.last_t = now
+        self.gauge = None
+        self.progress = 0.0
+
+        if pose != self.pose:
+            self._exit(self.pose)
+            self.hold_start.clear()
+            self.fired.clear()
+            self.pose = pose
+            self.need_resume = True
+            if self.active and f is not None:
+                self._enter(pose, f)
+
+        if f is None:
+            return
+
+        if pose == "SHAKA":
+            self._hold("toggle", CFG.toggle_hold, self.toggle)
+
+        if not self.active:
+            return
+
+        if pose == "POINT":
+            if f.pinch["index"] < CFG.freeze_ratio:
+                self.need_resume = True
+            else:
+                self._move(f.anchor, dt)
+        elif pose == "PINCH_INDEX":
+            if not self.dragging:
+                d = math.hypot(
+                    f.anchor[0] - self.pinch_anchor[0],
+                    f.anchor[1] - self.pinch_anchor[1],
+                )
+                if d > CFG.drag_start:
+                    self.dragging = True
+                    self.need_resume = True
+                    self.flash("ZIEHEN", 0.5)
+            if self.dragging:
+                self._move(f.anchor, dt)
+        elif pose == "SCROLL":
+            self._scroll(f, dt)
+        elif pose == "VOLUME":
+            self._volume(f)
+        elif pose == "OPEN":
+            self._swipe(f)
+        elif pose == "THREE":
+            self._hold("three", CFG.hold_time, self._task_view)
+        elif pose == "THUMB_UP":
+            self._hold("thumb_up", CFG.hold_time, lambda: self._key("playpause", "PLAY / PAUSE"))
+        elif pose == "THUMB_DOWN":
+            self._hold("thumb_down", CFG.hold_time, lambda: self._key("volumemute", "STUMM"))
+
+
+def put(img, text, org, scale=0.6, color=WHITE, thick=1):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img, text, org, font, scale, BLACK, thick + 2, cv2.LINE_AA)
+    cv2.putText(img, text, org, font, scale, color, thick, cv2.LINE_AA)
+
+
+def panel(img, x1, y1, x2, y2, alpha=0.55):
+    h, w = img.shape[:2]
+    x1, y1 = max(x1, 0), max(y1, 0)
+    x2, y2 = min(x2, w), min(y2, h)
+    if x2 <= x1 or y2 <= y1:
+        return
+    roi = img[y1:y2, x1:x2]
+    if roi.size:
+        roi[:] = (roi * (1 - alpha)).astype(np.uint8)
+
+
+def to_pixels(landmarks, w, h):
+    return [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+
+
+def draw_hand(frame, pts, is_main, show_lines):
+    line_col = DARK_GREEN if is_main else DIM_GREEN
+    dot_col = GREEN if is_main else DARK_GREEN
+    if show_lines:
+        for a, b in HAND_CONNECTIONS:
+            cv2.line(frame, pts[a], pts[b], line_col, 2, cv2.LINE_AA)
+    for i, p in enumerate(pts):
+        r = 9 if i in (4, 8, 12, 16, 20) else 6
+        cv2.circle(frame, p, r, dot_col, -1, cv2.LINE_AA)
+        cv2.circle(frame, p, r, BLACK, 1, cv2.LINE_AA)
+
+
+def draw_ui(frame, ctrl, f, fps, pose, raw, show_help, show_debug, show_zone):
+    h, w = frame.shape[:2]
+    active = ctrl.active
+
+    if show_zone:
+        x1, x2 = int(CFG.margin_x * w), int((1 - CFG.margin_x) * w)
+        y1, y2 = int(CFG.margin_top * h), int((1 - CFG.margin_bottom) * h)
+        col = CYAN if active else RED
+        cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
+        put(frame, "aktive Zone", (x1 + 6, y1 + 20), 0.5, col)
+
+    if f is not None and pose in ("POINT", "PINCH_INDEX"):
+        col = RED if pose == "PINCH_INDEX" else WHITE
+        cv2.circle(frame, f.anchor_px, 16, col, 2, cv2.LINE_AA)
+        if f.pinch["index"] < 1.0:
+            cv2.line(frame, f.pts[THUMB_TIP], f.pts[INDEX_TIP], col, 2, cv2.LINE_AA)
+
+    if f is not None and ctrl.gauge is not None:
+        a_y, c_y, col = ctrl.gauge
+        gx = min(f.pts[MIDDLE_MCP][0] + 140, w - 40)
+        y0, y1 = int(a_y * h), int(c_y * h)
+        cv2.line(frame, (gx - 30, y0), (gx + 30, y0), WHITE, 2)
+        cv2.line(frame, (gx, y0), (gx, y1), col, 4)
+        cv2.circle(frame, (gx, y1), 10, col, -1, cv2.LINE_AA)
+
+    if f is not None and ctrl.progress > 0:
+        x, y = f.pts[WRIST][0] - 60, min(f.pts[WRIST][1] + 40, h - 30)
+        cv2.rectangle(frame, (x, y), (x + 120, y + 12), WHITE, 1)
+        cv2.rectangle(frame, (x, y), (x + int(120 * ctrl.progress), y + 12), YELLOW, -1)
+        put(frame, HOLD_LABELS.get(ctrl.progress_label, ""), (x, y - 6), 0.5, YELLOW)
+
+    panel(frame, 0, 0, 470, 118)
+    status = "AN" if active else "AUS (Vorschau)"
+    put(frame, f"STEUERUNG: {status}", (10, 26), 0.7, GREEN if active else RED, 2)
+    put(frame, f"Geste: {POSE_NAMES.get(pose, pose)}", (10, 54), 0.6)
+    put(frame, f"FPS: {int(fps)}", (10, 80), 0.55, GREEN)
+    if not active:
+        put(frame, "Starten: Taste K oder Shaka halten", (10, 106), 0.55, YELLOW)
+
+    if ctrl.t < ctrl.flash_until and ctrl.flash_text:
+        (tw, _), _ = cv2.getTextSize(ctrl.flash_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+        put(frame, ctrl.flash_text, ((w - tw) // 2, 60), 1.2, YELLOW, 3)
+
+    if show_help:
+        pw = 330
+        panel(frame, w - pw - 10, 10, w - 10, 40 + len(CHEAT_SHEET) * 24)
+        put(frame, "GESTEN", (w - pw, 32), 0.6, GREEN, 2)
+        for i, (g, a) in enumerate(CHEAT_SHEET):
+            y = 58 + i * 24
+            put(frame, g, (w - pw, y), 0.45, WHITE)
+            put(frame, a, (w - pw + 130, y), 0.45, YELLOW)
+
+    if show_debug and f is not None:
+        e = f.ext
+        p = f.pinch
+        lines = [
+            f"roh: {raw}  stabil: {pose}",
+            "Streckung I:%.2f M:%.2f R:%.2f P:%.2f" % (e["index"], e["middle"], e["ring"], e["pinky"]),
+            "Pinch     I:%.2f M:%.2f R:%.2f" % (p["index"], p["middle"], p["ring"]),
+            "Daumen weg:%.2f  hoch:%s" % (f.thumb_reach, f.thumb_up_dir),
+        ]
+        panel(frame, 0, h - 110, 470, h)
+        for i, ln in enumerate(lines):
+            put(frame, ln, (10, h - 85 + i * 24), 0.5, WHITE)
+
+    put(frame, "Q:Ende K:An/Aus H:Hilfe D:Debug L:Linien Z:Zone S:Foto",
+        (10, h - (120 if show_debug else 12)), 0.45, WHITE)
+
+
+class AppState:
+    def __init__(self):
+        self.quit = threading.Event()
+        self.toggle_req = threading.Event()
+        self.cycle_req = threading.Event()
+        self.preview = CFG.preview
+
+
+class UiState:
+    def __init__(self):
+        self.help = True
+        self.debug = False
+        self.lines = True
+        self.zone = True
+
+
+def start_hotkeys(state):
+    if pynput_keyboard is None:
+        print("Hinweis: Für globale Tastenkuerzel:  pip install pynput")
+        return None
+    try:
+        hk = pynput_keyboard.GlobalHotKeys({
+            "<ctrl>+<shift>+<f9>": state.toggle_req.set,
+            "<ctrl>+<shift>+<f10>": state.quit.set,
+            "<ctrl>+<shift>+<f11>": state.cycle_req.set,
+        })
+        hk.start()
+        return hk
+    except Exception as exc:
+        print(f"Globale Tastenkuerzel nicht verfügbar: {exc}")
+        return None
+
+
+def make_tray_image(active):
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    color = (0, 200, 0, 255) if active else (210, 40, 40, 255)
+    d.ellipse((6, 6, 58, 58), fill=color)
+    d.ellipse((24, 24, 40, 40), fill=(255, 255, 255, 255))
+    return img
+
+
+class Tray:
+    def __init__(self, state, ctrl):
+        self.state = state
+        self.ctrl = ctrl
+        self.icon = None
+        self.last = None
+
+    def start(self):
+        if pystray is None:
+            print("Hinweis: Für ein Tray-Symbol:  pip install pystray pillow")
+            return
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem(
+                    "Steuerung an/aus",
+                    lambda icon, item: self.state.toggle_req.set(),
+                    checked=lambda item: self.ctrl.active,
+                ),
+                pystray.MenuItem(
+                    "Vorschau wechseln (aus / mini / gross)",
+                    lambda icon, item: self.state.cycle_req.set(),
+                ),
+                pystray.MenuItem("Beenden", lambda icon, item: self.state.quit.set()),
+            )
+            self.last = self.ctrl.active
+            self.icon = pystray.Icon(
+                "hand_control",
+                make_tray_image(self.last),
+                "Hand Control: " + ("AN" if self.last else "AUS"),
+                menu,
+            )
+            self.icon.run_detached()
+        except Exception as exc:
+            print(f"Tray-Symbol nicht verfügbar: {exc}")
+            self.icon = None
+
+    def update(self):
+        if self.icon is None or self.ctrl.active == self.last:
+            return
+        self.last = self.ctrl.active
+        try:
+            self.icon.icon = make_tray_image(self.last)
+            self.icon.title = "Hand Control: " + ("AN" if self.last else "AUS")
+        except Exception:
+            pass
+
+    def stop(self):
+        if self.icon is not None:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+
+
+def open_preview(mode):
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    if mode == "mini":
+        cv2.resizeWindow(WIN, MINI_W, MINI_H)
+        try:
+            cv2.setWindowProperty(WIN, cv2.WND_PROP_TOPMOST, 1)
+        except Exception:
+            pass
+        try:
+            sw, sh = pyautogui.size()
+            cv2.moveWindow(WIN, sw - MINI_W - 20, sh - MINI_H - 90)
+        except Exception:
+            pass
+    else:
+        cv2.resizeWindow(WIN, 960, 540)
+        try:
+            cv2.setWindowProperty(WIN, cv2.WND_PROP_TOPMOST, 0)
+        except Exception:
+            pass
+
+
+def close_preview():
+    try:
+        cv2.destroyWindow(WIN)
+        cv2.waitKey(1)
+    except cv2.error:
+        pass
+
+
+def draw_mini(frame, hands, main_hand, ctrl, pose, show_lines):
+    h, w = frame.shape[:2]
+    small = cv2.resize(frame, (MINI_W, MINI_H), interpolation=cv2.INTER_AREA)
+    sx, sy = MINI_W / w, MINI_H / h
+    for hnd in hands:
+        pts = [(int(x * sx), int(y * sy)) for x, y in hnd["pts"]]
+        is_main = hnd is main_hand
+        if show_lines:
+            for a, b in HAND_CONNECTIONS:
+                cv2.line(small, pts[a], pts[b], DARK_GREEN if is_main else DIM_GREEN, 1, cv2.LINE_AA)
+        for p in pts:
+            cv2.circle(small, p, 3, GREEN if is_main else DARK_GREEN, -1, cv2.LINE_AA)
+
+    col = GREEN if ctrl.active else RED
+    cv2.rectangle(small, (0, 0), (MINI_W - 1, MINI_H - 1), col, 4)
+    panel(small, 4, 4, MINI_W - 4, 46)
+    put(small, "AN" if ctrl.active else "AUS (Vorschau)", (10, 24), 0.55, col, 2)
+    put(small, POSE_NAMES.get(pose, pose), (10, 42), 0.42, WHITE)
+    if ctrl.t < ctrl.flash_until and ctrl.flash_text:
+        put(small, ctrl.flash_text, (10, MINI_H - 14), 0.6, YELLOW, 2)
+    return small
+
+
+def handle_key(key, ui, ctrl, state, frame):
+    if key in (27, ord("q")):
+        state.quit.set()
+    elif key == ord("k"):
+        ctrl.toggle()
+    elif key == ord("h"):
+        ui.help = not ui.help
+    elif key == ord("d"):
+        ui.debug = not ui.debug
+    elif key == ord("l"):
+        ui.lines = not ui.lines
+    elif key == ord("z"):
+        ui.zone = not ui.zone
+    elif key == ord("p"):
+        state.cycle_req.set()
+    elif key == ord("s") and frame is not None:
+        name = datetime.now().strftime("hand_%Y%m%d_%H%M%S.png")
+        cv2.imwrite(name, frame)
+        print(f"Screenshot gespeichert: {name}")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Computer mit Handgesten steuern")
+    p.add_argument("--camera", type=int, default=CFG.camera)
+    p.add_argument("--width", type=int, default=CFG.width)
+    p.add_argument("--height", type=int, default=CFG.height)
+    p.add_argument("--preview", choices=["none", "mini", "full"], default=CFG.preview,
+                   help="none = unsichtbar im Hintergrund, mini = kleines Fenster immer oben, full = grosses Fenster")
+    p.add_argument("--max-fps", type=int, default=CFG.max_fps,
+                   help="Begrenzt die Verarbeitung, schont die CPU (0 = unbegrenzt)")
+    p.add_argument("--no-beep", action="store_true", help="Kein Piepton beim Umschalten")
+    p.add_argument("--main-hand", choices=["any", "right", "left"], default=CFG.main_hand,
+                   help="Welche Hand steuert (Standard: jede)")
+    p.add_argument("--start-active", action="store_true",
+                   help="Steuerung sofort aktiv (sonst Vorschau-Modus)")
+    p.add_argument("--smooth", type=float, default=CFG.smooth,
+                   help="Glättung: kleiner = ruhiger (Standard 1.2)")
+    p.add_argument("--scroll-speed", type=float, default=CFG.scroll_speed)
+    p.add_argument("--invert-scroll", action="store_true")
+    p.add_argument("--margin-x", type=float, default=CFG.margin_x)
+    p.add_argument("--margin-top", type=float, default=CFG.margin_top)
+    p.add_argument("--margin-bottom", type=float, default=CFG.margin_bottom)
+    p.add_argument("--conf", type=float, default=CFG.conf)
+    return p.parse_args()
+
+
+def pick_main(hands):
+    if not hands:
+        return None
+    if CFG.main_hand == "any":
+        return hands[0]
+    for hnd in hands:
+        if hnd["label"].lower() == CFG.main_hand:
+            return hnd
+    return None
+
+
+def main():
+    args = parse_args()
+    CFG.camera = args.camera
+    CFG.width = args.width
+    CFG.height = args.height
+    CFG.preview = args.preview
+    CFG.max_fps = args.max_fps
+    CFG.beep = not args.no_beep
+    CFG.main_hand = args.main_hand
+    CFG.start_active = args.start_active
+    CFG.smooth = args.smooth
+    CFG.scroll_speed = args.scroll_speed
+    CFG.invert_scroll = args.invert_scroll
+    CFG.margin_x = args.margin_x
+    CFG.margin_top = args.margin_top
+    CFG.margin_bottom = args.margin_bottom
+    CFG.conf = args.conf
+
+    ensure_model()
+
+    options = vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=CFG.conf,
+        min_hand_presence_confidence=CFG.conf,
+        min_tracking_confidence=CFG.conf,
+    )
+    landmarker = vision.HandLandmarker.create_from_options(options)
+
+    cam = CameraStream(CFG.camera, CFG.width, CFG.height)
+    if not cam.opened():
+        print(f"Kamera {CFG.camera} konnte nicht geöffnet werden. Probiere --camera 1")
+        print("(Wird die Kamera gerade von einer anderen App benutzt, z.B. Zoom/Teams?)")
+        return
+    cam.start()
+
+    ctrl = Controller()
+    stab = Stabilizer()
+    state = AppState()
+    ui = UiState()
+
+    hotkeys = start_hotkeys(state)
+    tray = Tray(state, ctrl)
+    tray.start()
+    can_bg = hotkeys is not None or tray.icon is not None
+
+    print(__doc__)
+    print("Programm läuft. Steuerung startet",
+          "AN." if CFG.start_active else "im VORSCHAU-Modus.")
+    if can_bg:
+        print("Hintergrund: Strg+Shift+F9 = an/aus, F10 = beenden, F11 = Vorschau.")
+    else:
+        print("Ohne pynput/pystray gibt es keine Tastenkuerzel im Hintergrund.")
+        print("Installiere:  pip install pynput pystray pillow")
+
+    shown = None
+    start = time.time()
+    last_ts = -1
+    last_fid = -1
+    fps = 0.0
+    prev = time.time()
+
+    try:
+        while not state.quit.is_set():
+            loop_start = time.time()
+
+            if state.toggle_req.is_set():
+                state.toggle_req.clear()
+                ctrl.toggle()
+            if state.cycle_req.is_set():
+                state.cycle_req.clear()
+                state.preview = NEXT_PREVIEW[state.preview]
+            if state.preview != shown:
+                if shown not in (None, "none"):
+                    close_preview()
+                if state.preview != "none":
+                    open_preview(state.preview)
+                shown = state.preview
+
+            frame, fid = cam.read()
+            if frame is None or fid == last_fid:
+                time.sleep(0.003)
+                if shown != "none":
+                    handle_key(cv2.waitKey(1) & 0xFF, ui, ctrl, state, None)
+                continue
+            last_fid = fid
+
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            ts = int((time.time() - start) * 1000)
+            if ts <= last_ts:
+                ts = last_ts + 1
+            last_ts = ts
+            result = landmarker.detect_for_video(mp_image, ts)
+
+            hands = []
+            for i, lms in enumerate(result.hand_landmarks):
+                label = "Right"
+                if i < len(result.handedness) and result.handedness[i]:
+                    label = result.handedness[i][0].category_name
+                hands.append({"pts": to_pixels(lms, w, h), "label": label})
+
+            main_hand = pick_main(hands)
+            now = time.time()
+
+            f = None
+            raw = "NONE"
+            pose = stab.reset()
+            if main_hand is not None:
+                f = Features(main_hand["pts"], w, h)
+                raw = classify(f, stab.cur)
+                pose = stab.update(raw)
+
+            ctrl.update(pose, f, now)
+            tray.update()
+
+            inst = 1.0 / max(now - prev, 1e-6)
+            fps = fps * 0.9 + inst * 0.1 if fps else inst
+            prev = now
+
+            if shown == "full":
+                for hnd in hands:
+                    draw_hand(frame, hnd["pts"], hnd is main_hand, ui.lines)
+                draw_ui(frame, ctrl, f, fps, pose, raw, ui.help, ui.debug, ui.zone)
+                cv2.imshow(WIN, frame)
+            elif shown == "mini":
+                cv2.imshow(WIN, draw_mini(frame, hands, main_hand, ctrl, pose, ui.lines))
+
+            if shown != "none":
+                handle_key(cv2.waitKey(1) & 0xFF, ui, ctrl, state, frame)
+                try:
+                    if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
+                        if can_bg:
+                            state.preview = "none"
+                        else:
+                            state.quit.set()
+                except cv2.error:
+                    if can_bg:
+                        state.preview = "none"
+                    else:
+                        state.quit.set()
+
+            if CFG.max_fps > 0:
+                spare = 1.0 / CFG.max_fps - (time.time() - loop_start)
+                if spare > 0:
+                    time.sleep(spare)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ctrl.shutdown()
+        tray.stop()
+        if hotkeys is not None:
+            try:
+                hotkeys.stop()
+            except Exception:
+                pass
+        cam.stop()
+        landmarker.close()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
+

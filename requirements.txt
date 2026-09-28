@@ -1,0 +1,9 @@
+opencv-python
+mediapipe
+pyautogui
+numpy
+
+# Optional:
+pynput
+pystray
+pillow
